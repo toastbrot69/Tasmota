@@ -18,7 +18,7 @@
 */
 
 /*
-  Interrupt handler, pulse-ringbuffer and below decoders added 2020 by
+  Interrupt handler, pulse-ringbuffer/ook and below decoders added 2020 by
   Thorsten Pohlmann, tasm.tp<at>pohlmaenner.com
 
   WT450H (temp, hum, batt)
@@ -38,6 +38,54 @@
  * USE_THEO_V2    Add support for 434MHz Theo V2 sensors as documented on https://sidweb.nl
  * USE_ALECTO_V2  Add support for 868MHz Alecto V2 sensors like ACH2010, WS3000 and DKW2012 weather stations
 \*********************************************************************************************/
+
+/*
+  Interrupt handler, pulse-ringbuffer, decoders and mqtt-push added 2020 by
+  Thorsten Pohlmann, tasm.tp<at>pohlmaenner.com
+
+  WT450H (temp, hum, batt)
+  LaCrosse TX3 (temp, hum)
+  Infactory (Pearl) (temp, hum, batt)
+
+  Required hardware: slightly modified Sonoff-rf-bridge or any 433/868MHz receiver with OOK/carrier pin
+  Tested with:
+    -- A Sonoff-RF-Bridge (433MHz) can be used with a minor hardware-patch, no Portisch-Firmware needed.
+       Also the "normal" or Portisch features for decoding/sending are unharmed. 
+      - Wire a 160...680 Ohm resistor from pin 10 of the EFM8BB1 to any free gpio of the ESP. 
+        This might be gpio 4/5 if the USB lines have been cut (R2), or one of the free gpio 12/14 
+        pads on the bottom-side. Iam using gpio 4.
+        See https://github.com/xoseperez/espurna/wiki/Hardware-Itead-Sonoff-RF-Bridge---Direct-Hack
+   
+
+  Commands: sensor37 debug 0..3 0: no debug output
+                                1: pulse-duration output for protocol reverse-engineering
+                                2: output from the various OOK decoders
+                                3: 1+2   
+  
+  Howto add a new decoder:
+  =========================
+  
+  1.: implement: int your_protocol_decoder(bool initial_ook, uint16_t* pulses, int len) 
+                                                initial_ook: pin state during 1st pulse
+                                                return: != 0 if pulses contained valid data
+  
+             - you may reuse one of the OOK decoders (time-pulses -> 1/0)
+             int decodeOOKxxx(int min_bits, uint16_t* pulses, int len, ...)
+                              min_bits: minimum number of valid bits in a row needed for protocol parser
+                              return: offset to pulses where parsing ended
+ 
+             - stores bits as 0/1 in ook_data.data, number of bit: ook_data.num_data
+             - returns at 1st invalid pulse (if enough bits in ook_data)
+             - may then be called again by decoder with proper offset
+  
+             use mqttStart/mqttEnd() to send data
+                            
+  
+  2.: Add your_protocol_decoder() to checkPulses()
+  
+  
+*/
+
 
 #define XSNS_37                   37
 
@@ -77,7 +125,7 @@ typedef enum
   deb_ookval = 1<<2,
 }debug_e;
 
-static unsigned int debug_val = deb_ook | deb_pulses;
+static unsigned int debug_val = 0; //deb_ook | deb_pulses;
 
 
 static void ICACHE_RAM_ATTR interruptHandler();
@@ -286,15 +334,15 @@ static void print_ook_debug(char* pr, int pr_len, int len, int min_bits)
     {
       pr[pr_len] = 0;
 
+      snprintf_P(log_data, sizeof(log_data), S_OOK_DEBUG2, pr);
+      AddLog(LOG_LEVEL_INFO);
+
       snprintf_P(log_data, sizeof(log_data), S_OOK_DEBUG1, len, ook_data.num_data, min_bits);
       AddLog(LOG_LEVEL_INFO);
 
       snprintf_P(log_data, sizeof(log_data), "%s", pr);
       AddLog(LOG_LEVEL_INFO);
-
-      snprintf_P(log_data, sizeof(log_data), S_OOK_DEBUG2, pr);
-      AddLog(LOG_LEVEL_INFO);
-    }
+   }
   }
 }
 
@@ -720,11 +768,9 @@ static int decodeLaCrosse(bool initial_ook, uint16_t* pulses, int len)
       {
         type = "Humidity";
         mqttHumidity(pdata.value);
-        //humMqtt((int)pdata.value, PSTR("LaCrosse-TX3-%u"), pdata.addr);
       }
       else
       {
-        //tempMqtt(pdata.value, PSTR("LaCrosse-TX3-%u"), pdata.addr);  
         mqttTemperature(pdata.value);
       }
 

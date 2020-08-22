@@ -18,7 +18,7 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifdef USE_433_RAW
+#ifdef _not_USE_433_RAW
 
 /*********************************************************************************************\
  * Decoding of OOK (on-off-keying) based temperature/humidity sensors from various 

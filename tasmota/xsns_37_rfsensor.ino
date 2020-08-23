@@ -21,8 +21,11 @@
   Interrupt handler, pulse-ringbuffer/ook and below decoders added 2020 by
   Thorsten Pohlmann, tasm.tp<at>pohlmaenner.com
 
+  OOK WT450H
   WT450H (temp, hum, batt)
+  OOK LaCrosse TX3
   LaCrosse TX3 (temp, hum)
+  OOK infactory
   Infactory (Pearl) (temp, hum, batt)
 */
 
@@ -55,7 +58,7 @@
         This might be gpio 4/5 if the USB lines have been cut (R2), or one of the free gpio 12/14 
         pads on the bottom-side. Iam using gpio 4.
         See https://github.com/xoseperez/espurna/wiki/Hardware-Itead-Sonoff-RF-Bridge---Direct-Hack
-   
+    -- A CC1101 board, this would require an extra library (lSatan)   
 
   Commands: sensor37 debug 0..3 0: no debug output
                                 1: pulse-duration output for protocol reverse-engineering
@@ -78,7 +81,7 @@
              - returns at 1st invalid pulse (if enough bits in ook_data)
              - may then be called again by decoder with proper offset
   
-             use mqttStart/mqttEnd() to send data
+             use jsonStart/Temp/.../jsonEnd + mqttSend() to send data
                             
   
   2.: Add your_protocol_decoder() to checkPulses()
@@ -88,6 +91,41 @@
 
 
 #define XSNS_37                   37
+
+#define USE_CC1101
+#ifdef USE_CC1101
+/*
+  To use a CC1101 board in ELECHOUSE/lSatan OOK-mode connect it like 
+  SCK_PIN   = D1 Mini: D5 (GPIO 14)
+  MISO_PIN  = D1 Mini: D6 (GPIO 12)
+  MOSI_PIN  = D1 Mini: D7 (GPIO 13)
+  SS_PIN    = D1 Mini: D8 (GPIO 15)
+  GDO0      = pin template config "OOK RX"
+*/
+
+  #include "../lib/SmartRC-CC1101-Driver-Lib/ELECHOUSE_CC1101_SRC_DRV.h"
+  static float cc1101_freq = 433.920;
+
+void initCC1101(void)
+{
+  // check if the fixed CC1101 pins are being used by other sensors
+  if(GetPin(10) + GetPin(11) + GetPin(12) + GetPin(13) == GPIO_NONE)
+  {
+    ELECHOUSE_cc1101.Init(); // Initialize the cc1101. 
+
+    ELECHOUSE_cc1101.SetRx(cc1101_freq); //Sets receive on and changes the frequency.
+    snprintf_P(log_data, sizeof(log_data), "CC1101 freq: %i.%03i", (int)cc1101_freq, (int)(cc1101_freq*100)%100);
+  }
+  else
+  {
+    snprintf_P(log_data, sizeof(log_data), "CC1101 default pins occupied");
+  }
+  AddLog(LOG_LEVEL_INFO);
+
+}
+
+#endif
+
 
 //#define USE_THEO_V2                      // Add support for 434MHz Theo V2 sensors as documented on https://sidweb.nl
 //#define USE_ALECTO_V2                    // Add support for 868MHz Alecto V2 sensors like ACH2010, WS3000 and DKW2012
@@ -123,10 +161,10 @@ typedef enum
   deb_pulses = 1<<0,
   deb_ook    = 1<<1,
   deb_ookval = 1<<2,
+  deb_cache  = 1<<3,
 }debug_e;
 
 static unsigned int debug_val = 0; //deb_ook | deb_pulses;
-
 
 static void ICACHE_RAM_ATTR interruptHandler();
 
@@ -154,6 +192,10 @@ static void RfPulseInit(void)
   }
   memset(pulses_arr, 0, sizeof(pulses_t) * SIZE_PULSES_ARR);
   
+#ifdef USE_CC1101
+  initCC1101();
+#endif
+
   pin_interrupt = interrupt;
 
   attachInterrupt(interrupt, interruptHandler, CHANGE);
@@ -207,75 +249,197 @@ static void ICACHE_RAM_ATTR interruptHandler()
 }
 
 ///////////////////////////////////////////////////////////////////
-static struct 
-{
-  char  sensor[100];
-  float temp = -1000;
-  float hum = -1000;
-}last_values;
 
+#define LV_NUM      10
+
+typedef struct last_values_t
+{
+  last_values_t()
+  {
+    when = 0;
+    subtype = 0;
+    topic[0] = 0;
+    json[0] = 0;
+  }
+
+  unsigned long when;
+  int           subtype;
+  char          topic[60];
+  char          json[200];
+}last_values_t;
+
+static last_values_t last_values[LV_NUM];
+
+#define LV_TOO_FAST (5*1000)
+#define LV_TIMEOUT  (30*60*1000)
+
+// finds the exactly same but old enough,
+//       otherwise an expired one
+// return = 0: too fast, ignore
+// return != 0: value set
+static int setLastValue(struct last_values_t* nv)
+{
+  unsigned long now = millis();
+  int t;
+
+  for(t = 0; t < LV_NUM; t++)
+  {
+    last_values_t& e = last_values[t];
+
+    if(nv->subtype == e.subtype && strcmp(nv->topic, e.topic) == 0)
+    {
+      int dif = now - e.when;
+
+      if(dif < LV_TOO_FAST)
+      {
+        if(debug_val & deb_cache)
+        {
+          snprintf_P(log_data, sizeof(log_data), "setLastValue(#%i, %s, %i): %i repeat", t, e.topic, e.subtype, dif);
+          AddLog(LOG_LEVEL_INFO);
+        }
+        return 0;
+      }
+
+      if(debug_val & deb_cache)
+      {
+        snprintf_P(log_data, sizeof(log_data), "setLastValue(#%i, %s, %i): %i refresh", t, e.topic, e.subtype, dif);
+        AddLog(LOG_LEVEL_INFO);
+      }
+
+      e = *nv;
+      e.when = now;
+
+      return 1;
+    }
+  }
+
+  int maxdif = 0;
+  int maxix = 0;
+
+  for(t = 0; t < LV_NUM; t++)
+  {
+    last_values_t& e = last_values[t];
+
+    if(e.topic[0] && e.json[0]) // non empty entry
+    {
+      int dif = now - e.when;
+      if(dif >= maxdif)
+      {
+        maxdif = dif;
+        maxix = t; 
+      }
+    }
+    else
+    {
+      maxix = t;
+      break;
+    }
+    
+  }
+
+  if(debug_val & deb_cache)
+  {
+    snprintf_P(log_data, sizeof(log_data), "setLastValue(#%i, %s, %i): %i replace", maxix, nv->topic, nv->subtype, now - last_values[maxix].when);
+    AddLog(LOG_LEVEL_INFO);
+  }
+
+  last_values[maxix]       = *nv;
+  last_values[maxix].when  = now;
+
+  return 1;
+}
+
+static void cleanupLastValues(void)
+{
+  unsigned long now = millis();
+  int t;
+
+  for(t = 0; t < LV_NUM; t++)
+  {
+    last_values_t& e = last_values[t];
+
+    if(e.topic[0] == 0)
+      continue;
+
+    int dif = now - e.when;
+
+    if(dif < LV_TIMEOUT)
+      continue;
+
+    if(debug_val & deb_cache)
+    {
+      snprintf_P(log_data, sizeof(log_data), "cleanupLastValues(#%i, %s, %i): %i expired", t, e.topic, e.subtype, now - e.when);
+      AddLog(LOG_LEVEL_INFO);
+    }
+
+    e.topic[0] = 0;
+    e.json[0] = 0;
+  }
+  
+}
 // mqtt output:
 // mqtt: /tele/<tasmota_device>/OOK/device-21 = {"Time":"2020-08-02T12:26:40","type":"my decoder","Temperature":27.0,"Humidity":53.0,"BatteryGood":1}
 //                                  111111111                                         2222222222
 
-// mqttStart("my decoder", "device-%i", device.addr) // prepare mqtt frame
-//            2222222222    111111111
-//  optional: mqttTemperature(27.0)                  // add temperature to mqtt frame
-//  optional: mqttHumidity(53.0)
-//  optional: mqttBatteryGood(true)
-// mqttEnd()                                         // send mqtt frame
+// last_values_t lvt;
+// jsonStart(&lvt, "my decoder", "device-%i", device.addr) // prepare mqtt frame
+//                  2222222222    111111111
+//  optional: jsonTemperature(&lvt, 27.0)                  // add temperature to mqtt frame
+//  optional: jsonHumidity(&lvt, 53.0)
+//  optional: jsonBatteryGood(&lvt, true)
+// jsonEnd(&lvt)                                         
+// mqttSend(&lvt)
 
-void mqttStart(const char* type, const char* sensor, ...)
+static void mqttSend(const last_values_t* v)
+{
+  ResponseTime_P(PSTR(",%s"), v->json);
+
+  char prefix[100];
+  sprintf(prefix, "OOK/%s", v->topic);
+
+  ResponseJsonEnd();
+  MqttPublishPrefixTopic_P(TELE, prefix);
+}
+
+void jsonStart(last_values_t* v, const char* type, const char* sensor, ...)
 {
   va_list args;
   va_start(args, sensor);
 
-  vsnprintf_P(last_values.sensor, sizeof(last_values.sensor), sensor, args);
+  vsnprintf_P(v->topic, sizeof(v->topic), sensor, args);
   va_end(args);
 
-  ResponseTime_P(PSTR(",\"type\":\"%s\","), type);
-
-#ifdef USE_CC1101
-  if(use_cc1101)
-    ResponseAppend_P(PSTR("\"Frequency\":%i.%03i,"  ), (int)cc1101_freq, (int)(cc1101_freq*1000) % 1000);
-#endif
-
-  last_values.temp = -1000;
-  last_values.hum = -1000;
+  snprintf_P(v->json, sizeof(v->json), PSTR("\"type\":\"%s\","), type);
 }
 
-void mqttTemperature(float temp)
+void jsonTemperature(last_values_t* v, float temp)
 {
   char str[33];
   dtostrfd(temp, Settings.flag2.temperature_resolution, str);
-  ResponseAppend_P(PSTR("\"" D_JSON_TEMPERATURE "\":%s,"  ), str);
-  last_values.temp = temp;
+  
+  int mlen = strlen(v->json);
+  snprintf_P(v->json + mlen, sizeof(v->json) - mlen, PSTR("\"" D_JSON_TEMPERATURE "\":%s,"  ), str);
 }
 
-void mqttHumidity(float hum)
+void jsonHumidity(last_values_t* v, float hum)
 {
   char str[33];
   dtostrfd(hum, Settings.flag2.temperature_resolution, str);
-  ResponseAppend_P(PSTR("\"" D_JSON_HUMIDITY "\":%s,"  ), str);
-  last_values.hum = hum;
+  int mlen = strlen(v->json);
+  snprintf_P(v->json + mlen, sizeof(v->json) - mlen, PSTR("\"" D_JSON_HUMIDITY "\":%s,"  ), str);
 }
 
-void mqttBatteryGood(bool good)
+void jsonBatteryGood(last_values_t* v, bool good)
 {
-  ResponseAppend_P(PSTR("\"BatteryGood\":%i,"  ), good ? 1 : 0);
+  int mlen = strlen(v->json);
+  snprintf_P(v->json + mlen, sizeof(v->json) - mlen, PSTR("\"BatteryGood\":%i,"  ), good ? 1 : 0);
 }
 
-void mqttEnd(void)
+void jsonEnd(last_values_t* v)
 {
-  int len = strlen(mqtt_data);
+  int len = strlen(v->json);
   if(len)
-    mqtt_data[len-1] = 0; // get rid of last ','
-
-  char prefix[150];
-  sprintf(prefix, "OOK/%s", last_values.sensor);
-
-  ResponseJsonEnd();
-  MqttPublishPrefixTopic_P(TELE, prefix);
+    v->json[--len] = 0; // get rid of last ','
 }
 
 ///////////////////////////////////////////////////////////////////
@@ -564,7 +728,6 @@ static int decodeOOK2(int min_bits, uint16_t* pulses, int len, int min_1, int ma
 typedef struct 
 {
   bool valid;
-  unsigned long when;
   uint8_t type;
   uint8_t addr;
   float   value;
@@ -755,30 +918,45 @@ static int decodeLaCrosse(bool initial_ook, uint16_t* pulses, int len)
       else
       {
         pdata.valid = true;
-        pdata.when = micros();
       }
 
       offs += 43-8;
 
       const char* type = "Temperature";
 
-      mqttStart(PSTR("LaCrosse TX3"), PSTR("LaCrosse-TX3-%u"), pdata.addr);
+      last_values_t lv;
+
+      jsonStart(&lv, PSTR("LaCrosse TX3"), PSTR("LaCrosse-TX3-%u"), pdata.addr);
       
+      lv.subtype = pdata.type;
+
       if(pdata.type)
       {
         type = "Humidity";
-        mqttHumidity(pdata.value);
+        jsonHumidity(&lv, pdata.value);
       }
       else
       {
-        mqttTemperature(pdata.value);
+        jsonTemperature(&lv, pdata.value);
       }
 
-      mqttEnd();
+      jsonEnd(&lv);
 
-      snprintf_P(log_data, sizeof(log_data), "LaCrosse TX3: type:%u addr:%u %s:%i.%i", pdata.type, pdata.addr, type, (int)pdata.value, (int)(pdata.value*10)%10);
-      AddLog(LOG_LEVEL_INFO);
-
+      if(setLastValue(&lv))
+      {
+        snprintf_P(log_data, sizeof(log_data), "LaCrosse TX3: type:%u addr:%u %s:%i.%i", pdata.type, pdata.addr, type, (int)pdata.value, (int)(pdata.value*10)%10);
+        AddLog(LOG_LEVEL_INFO);
+        mqttSend(&lv);
+      }
+      else
+      {
+        if(debug_val & deb_cache)
+        {
+          snprintf_P(log_data, sizeof(log_data), "ignored LaCrosse TX3: type:%u addr:%u", pdata.type, pdata.addr, type);
+          AddLog(LOG_LEVEL_INFO);
+        }
+      }
+      
       ++ret;
       break;
     }
@@ -799,7 +977,6 @@ typedef struct xsns_100_rawOOK
   bool  batt_low;
   float temp;
   float hum;
-
 }infactory_t;
 
 
@@ -896,14 +1073,29 @@ static int decodeInfactory(bool initial_ook, uint16_t* pulses, int len)
 
     if(pdata.valid)
     {
-      snprintf_P(log_data, sizeof(log_data), "Infactory: id:%u channel:%u humidity:%i temperature:%i.%i", pdata.id, pdata.channel, (int)pdata.hum, (int)pdata.temp, (int)(pdata.temp*10)%10);
-      AddLog(LOG_LEVEL_INFO);
+      last_values_t lv;
 
-      mqttStart(PSTR("Infactory"), PSTR("Infactory-%u-%u"), pdata.id, pdata.channel);
-      mqttTemperature(pdata.temp);
-      mqttHumidity(pdata.hum);
-      mqttBatteryGood(!pdata.batt_low);
-      mqttEnd();
+      jsonStart(&lv, PSTR("Infactory"), PSTR("Infactory-%u-%u"), pdata.id, pdata.channel);
+      jsonTemperature(&lv, pdata.temp);
+      jsonHumidity(&lv, pdata.hum);
+      jsonBatteryGood(&lv, !pdata.batt_low);
+      jsonEnd(&lv);
+
+      if(setLastValue(&lv))
+      {
+        snprintf_P(log_data, sizeof(log_data), "Infactory: id:%u channel:%u humidity:%i temperature:%i.%i", pdata.id, pdata.channel, (int)pdata.hum, (int)pdata.temp, (int)(pdata.temp*10)%10);
+        AddLog(LOG_LEVEL_INFO);
+
+        mqttSend(&lv);
+      }
+      else
+      {
+        if(debug_val & deb_cache)
+        {
+          snprintf_P(log_data, sizeof(log_data), "ignored Infactory: id:%u channel:%u", pdata.id, pdata.channel);
+          AddLog(LOG_LEVEL_INFO);
+        }
+      }
 
       ++ret;
       break;
@@ -1071,14 +1263,28 @@ static int decodeWT450H(bool initial_ook, uint16_t* pulses, int len)
         pdata.valid = true;
         pdata.when = micros();
         
-        snprintf_P(log_data, sizeof(log_data), "WT450H: house:%u channel:%u battery_weak:%i humidity:%i temperature:%i.%i", pdata.house, pdata.channel, (int)pdata.battery_weak, (int)pdata.hum, (int)pdata.temp, (int)(pdata.temp*10)%10);
-        AddLog(LOG_LEVEL_INFO);
+        last_values_t lv;
+        jsonStart(&lv, PSTR("WT450H"), PSTR("WT450H-%u-%u"), pdata.house, pdata.channel);
+        jsonTemperature(&lv, pdata.temp);
+        jsonHumidity(&lv, pdata.hum);
+        jsonBatteryGood(&lv, !pdata.battery_weak);
+        jsonEnd(&lv);
 
-        mqttStart(PSTR("WT450H"), PSTR("WT450H-%u-%u"), pdata.house, pdata.channel);
-        mqttTemperature(pdata.temp);
-        mqttHumidity(pdata.hum);
-        mqttBatteryGood(!pdata.battery_weak);
-        mqttEnd();
+        if(setLastValue(&lv))
+        {
+          snprintf_P(log_data, sizeof(log_data), "WT450H: house:%u channel:%u battery_weak:%i humidity:%i temperature:%i.%i", pdata.house, pdata.channel, (int)pdata.battery_weak, (int)pdata.hum, (int)pdata.temp, (int)(pdata.temp*10)%10);
+          AddLog(LOG_LEVEL_INFO);
+
+          mqttSend(&lv);
+        }
+        else
+        {
+          if(debug_val & deb_cache)
+          {
+            snprintf_P(log_data, sizeof(log_data), "ignored WT450H: house:%u channel:%u", pdata.house, pdata.channel);
+            AddLog(LOG_LEVEL_INFO);
+          }
+        }
 
         ++ret;
         break;
@@ -1096,7 +1302,7 @@ static int decodeWT450H(bool initial_ook, uint16_t* pulses, int len)
 
 #define RFSNS_VALID_WINDOW        1800   // Number of seconds for sensor to respond (1800 = 30 minutes)
 
-#define RFSNS_LOOPS_PER_MILLI     1900   // (345 voor 16MHz ATMega) Voor 80MHz NodeMCU (ESP-12E). Getest met TheoV2 Protocol.
+//#define RFSNS_LOOPS_PER_MILLI     1900   // (345 voor 16MHz ATMega) Voor 80MHz NodeMCU (ESP-12E). Getest met TheoV2 Protocol.
 #define RFSNS_RAW_BUFFER_SIZE     180    // (256) Maximum number of RF pulses that can be captured
 #define RFSNS_MIN_RAW_PULSES      112    // (16) =8 bits. Minimaal aantal ontvangen bits*2 alvorens cpu tijd wordt besteed aan decodering, etc.
                                          //   Zet zo hoog mogelijk om CPU-tijd te sparen en minder 'onzin' te ontvangen.
@@ -1730,6 +1936,8 @@ void RfSnsShow(bool json)
 // user context: scan tru pulse buffers
 void checkPulses(void)
 {
+  cleanupLastValues();
+
   // limit parsing to some frames (irq may be filling fast)
 
   for(int t = 0; t < SIZE_PULSES_ARR + 2; t++)
